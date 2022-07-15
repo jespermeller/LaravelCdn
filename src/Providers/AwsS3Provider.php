@@ -2,11 +2,13 @@
 
 namespace SampleNinja\LaravelCdn\Providers;
 
+use Aws\CloudFront\CloudFrontClient;
 use Aws\S3\BatchDelete;
 use Aws\S3\Exception\DeleteMultipleObjectsException;
 use Aws\S3\Exception\S3Exception;
 use Aws\S3\S3Client;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use SampleNinja\LaravelCdn\Contracts\CdnHelperInterface;
 use SampleNinja\LaravelCdn\Providers\Contracts\ProviderInterface;
 use SampleNinja\LaravelCdn\Validators\Contracts\ProviderValidatorInterface;
@@ -171,21 +173,50 @@ class AwsS3Provider extends Provider implements ProviderInterface
 
         // user terminal message
         $this->console->writeln('<fg=yellow>Comparing local files and bucket...</fg=yellow>');
-
         $assets = $this->getFilesAlreadyOnBucket($assets);
 
+        $manifest = array_flip(json_decode(file_get_contents(public_path('mix-manifest.json')), true));
+
+
+        dump($manifest);
         // upload each asset file to the CDN
         if (count($assets) > 0) {
             $this->console->writeln('<fg=yellow>Upload in progress......</fg=yellow>');
             foreach ($assets as $file) {
                 try {
-                    $this->console->writeln('<fg=cyan>'.'Uploading file path: '.$file->getRealpath().'</fg=cyan>');
-                    $command = $this->s3_client->getCommand('putObject', [
 
+
+                    $key = $this->supplier['upload_folder'] . str_replace('public/', '',str_replace('\\', '/', $file->getPathName()));
+
+                    $path = str_replace('\\', '/', $file->getPathName());
+
+                    $path = strstr($path,'public');
+
+                    $path = str_replace('public', '', $path);
+
+                    $this->console->writeln('<fg=cyan>'.'file path: '.$path.'</fg=cyan>');
+
+
+
+                    if(isset($manifest[$path])){
+                        if (($pos = strpos($manifest[$path], "id=")) !== FALSE) {
+                            $token = substr($manifest[$path], $pos+3);
+                            $key = $this->supplier['upload_folder']. $this->getVersionPath($path, $token);
+                        }
+                        else{
+                            Cache::forever($manifest[$path].'_path',$path);
+                        }
+                    }
+
+
+                    $this->console->writeln('<fg=cyan>'.'Uploading file path: '.$key.'</fg=cyan>');
+
+
+                    $command = $this->s3_client->getCommand('putObject', [
                         // the bucket name
                         'Bucket' => $this->getBucket(),
                         // the path of the file on the server (CDN)
-                        'Key' => $this->supplier['upload_folder'] . str_replace('\\', '/', $file->getPathName()),
+                        'Key' => $key,
                         // the path of the path locally
                         'Body' => fopen($file->getRealPath(), 'r'),
                         // the permission of the file
@@ -195,7 +226,6 @@ class AwsS3Provider extends Provider implements ProviderInterface
                         'Metadata' => $this->default['providers']['aws']['s3']['metadata'],
                         'Expires' => $this->default['providers']['aws']['s3']['expires'],
                     ]);
-
                     $this->s3_client->execute($command);
                 } catch (S3Exception $e) {
                     $this->console->writeln('<fg=red>Upload error: '.$e->getMessage().'</fg=red>');
@@ -211,6 +241,43 @@ class AwsS3Provider extends Provider implements ProviderInterface
         }
 
         return true;
+    }
+
+    public function getVersionPath($path, $token = null){
+        if($token){
+            Cache::forever($path,$token);
+
+        }
+        else
+            $token = Cache::get($token);
+
+
+
+        if($token){
+            $parts = explode( '.', $path);
+            $extension = array_pop($parts);
+            array_push($parts, $token, $extension);
+            $path = implode('.', $parts);
+            $path = substr($path, 1);
+        }
+
+        return $path;
+    }
+
+
+    /**
+     * @return CloudFrontClient
+     */
+    public function connectCloudFont()
+    {
+        return new CloudFrontClient([
+            'version'     => 'latest',
+            'region'      => $this->supplier['version'],
+            'credentials' => [
+                'key'    => env('AWS_ACCESS_KEY_ID'),
+                'secret' => env('AWS_SECRET_ACCESS_KEY')
+            ]
+        ]);
     }
 
     /**
@@ -273,17 +340,21 @@ class AwsS3Provider extends Provider implements ProviderInterface
             $filesOnAWS->put($file['Key'], $a);
         }
 
+
+
         $assets->transform(function ($item, $key) use (&$filesOnAWS) {
-            $fileOnAWS = $filesOnAWS->get(str_replace('\\', '/', $item->getPathName()));
 
-            // New item
-            if (!isset($fileOnAWS['LastModified'])) return $item;
+            $path = str_replace('public/','',str_replace('\\', '/', $item->getPathName()));
+            $key = str_replace('\\', '/',$this->supplier['upload_folder'] . $this->getVersionPath($path));
 
-            // Check if size has changed and only then upload
-            if ($item->getSize() !== $fileOnAWS['Size']) {
+
+            $fileOnAWS = $filesOnAWS->get($key);
+            //select to upload files that are different in size AND last modified time.
+            if (!($item->getMTime() <= $fileOnAWS['LastModified']) && !($item->getSize() === $fileOnAWS['Size'])) {
                 return $item;
             }
         });
+
 
         $assets = $assets->reject(function ($item) {
             return $item === null;
@@ -291,6 +362,7 @@ class AwsS3Provider extends Provider implements ProviderInterface
 
         return $assets;
     }
+
 
     /**
      * Get bucket
@@ -373,16 +445,14 @@ class AwsS3Provider extends Provider implements ProviderInterface
     {
         if ($this->getCloudFront() === true) {
             $url = $this->cdn_helper->parseUrl($this->getCloudFrontUrl());
-
-            return $url['scheme'] . '://' . $url['host'] . '/' . $path;
+            return $url['scheme'] . '://' . $url['host'] . $url['path'] . $path;
         }
 
         $url = $this->cdn_helper->parseUrl($this->getUrl());
-
         $bucket = $this->getBucket();
         $bucket = (!empty($bucket)) ? $bucket.'.' : '';
 
-        return $url['scheme'] . '://' . $bucket . $url['host'] . '/' . $path;
+        return $url['scheme'] . '://' . $bucket . $url['host'] . $url['path'] . $path;
     }
 
     /**

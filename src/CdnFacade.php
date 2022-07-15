@@ -9,6 +9,7 @@ use SampleNinja\LaravelCdn\Contracts\ProviderFactoryInterface;
 use SampleNinja\LaravelCdn\Exceptions\EmptyPathException;
 use SampleNinja\LaravelCdn\Providers\Contracts\ProviderInterface;
 use SampleNinja\LaravelCdn\Validators\CdnFacadeValidator;
+use Illuminate\Support\Facades\Cache;
 
 /**
  * Class CdnFacade.
@@ -146,14 +147,35 @@ class CdnFacade implements CdnFacadeInterface
     public function mix($path)
     {
         static $manifest = null;
-        if (is_null($manifest)) {
+        if (is_null($manifest) && file_exists(public_path('mix-manifest.json'))) {
             $manifest = json_decode(file_get_contents(public_path('mix-manifest.json')), true);
         }
-        if (isset($manifest['/' . $path])) {
-            return $this->generateUrl($manifest['/' . $path], 'public/');
+
+        if (isset($this->configurations['bypass']) && $this->configurations['bypass']) {
+            if (isset($manifest['/' . $path])) {
+                return $this->generateUrl($manifest['/' . $path], 'public/');
+            }
+            if (isset($manifest[$path])) {
+                return $this->generateUrl($manifest[$path], '');
+            }
         }
-        if (isset($manifest[$path])) {
-            return $this->generateUrl($manifest[$path], 'public/');
+
+        else{
+
+            $item = Cache::get($path.'_path');
+            if($item)
+                return $this->generateUrl($item);
+
+            $token = Cache::get($path);
+            if ($token) {
+                $parts = explode('.', $path);
+                $extension = array_pop($parts);
+                array_push($parts, $token, $extension);
+                $path = implode('.', $parts);
+                $path = substr($path, 1);
+
+                return $this->generateUrl($path);
+            }
         }
         throw new \InvalidArgumentException("File {$path} not defined in asset manifest.");
     }
